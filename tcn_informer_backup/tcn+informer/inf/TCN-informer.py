@@ -104,8 +104,9 @@ def model_train(net, train_loader, length_size, optimizer, criterion, num_epochs
             datapoints, labels, datapoints_mark, labels_mark = datapoints.to(device), labels.to(
                 device), datapoints_mark.to(device), labels_mark.to(device)
             optimizer.zero_grad()  # 清空梯度
-            preds = net(datapoints, datapoints_mark, labels, labels_mark, None).squeeze()  # 前向传播
-            labels = labels[:, -length_size:].squeeze()
+            preds = net(datapoints, datapoints_mark, labels, labels_mark, None)  # 前向传播
+            preds = preds[:, -length_size:, -1:] # 仅取目标变量通道
+            labels = labels[:, -length_size:, -1:] # 仅取目标变量通道
             loss = criterion(preds, labels)  # 计算损失
             loss.backward()  # 反向传播
             optimizer.step()  # 更新模型参数
@@ -158,11 +159,12 @@ def model_train_val(net, train_loader, val_loader, length_size, optimizer, crite
 
         net.train()  # 将模型设置为训练模式
         for i, (datapoints, labels, datapoints_mark, labels_mark) in enumerate(train_loader):
-            datapoints, labels, datapoints_mark, labels_mark = datapoints.to(device), labels.to(
-                device), datapoints_mark.to(device), labels_mark.to(device)
+            datapoints, labels, datapoints_mark, labels_mark = datapoints.to(
+                device), labels.to(device), datapoints_mark.to(device), labels_mark.to(device)
             optimizer.zero_grad()  # 清空梯度
-            preds = net(datapoints, datapoints_mark, labels, labels_mark, None).squeeze()  # 前向传播
-            labels = labels[:, -length_size:].squeeze()  # 注意这一步
+            preds = net(datapoints, datapoints_mark, labels, labels_mark, None)
+            preds = preds[:, -length_size:, -1:] # 仅取目标变量通道
+            labels = labels[:, -length_size:, -1:] # 仅取目标变量通道
             loss = criterion(preds, labels)  # 计算损失
             loss.backward()  # 反向传播
             optimizer.step()  # 更新模型参数
@@ -236,10 +238,28 @@ def cal_eval(y_real, y_pred):
     return df_eval
 
 
-df = pd.read_csv('data\\禹城数据（05年）.csv')
+df = pd.read_csv('data\\禹城数据（05年-10年）.csv')
+
+# --- 方向 A 优化：特征工程 (Feature Engineering) ---
+# 1. 滞后项 (Lagged Features): 捕捉生态滞后响应
+for col in ['PAR', 'DA_TAC', 'L1-VWC']:
+    for lag in range(1, 4):
+        df[f'{col}_lag{lag}'] = df[col].shift(lag)
+
+# 2. 差分项 (Differential Features): 捕捉环境突变速度
+for col in ['PAR', 'DA_TAC']:
+    df[f'{col}_diff'] = df[col].diff()
+
+# 3. 清理 NaN (由于 shift 和 diff 产生)
+df.dropna(inplace=True)
+
+# 4. 重新排列列顺序：确保目标变量 'target' 始终在最后一列
+feature_cols = [c for c in df.columns if c not in ['date', 'target']]
+df = df[['date'] + feature_cols + ['target']]
+
 # 注意多变量情况下，目标变量必须为最后一列
-data_dim = df[df.columns.drop('date')].shape[1]  # 一共多少个变量
-data_target = df['Target']  # 预测的目标变量
+data_dim = df[df.columns.drop('date')].shape[1]  # 动态计算变量总数
+data_target = df['target']  # 预测的目标变量 (全量数据中为小写)
 data = df[df.columns.drop('date')]  # 选取所有的数据
 
 # 时间戳
@@ -411,25 +431,30 @@ true, pred = true_uninverse, pred_uninverse
 df_eval = cal_eval(true, pred)  # 评估指标dataframe
 print(df_eval)
 
-df_pred_true = pd.DataFrame({'Predict': pred.flatten(), 'Real': true.flatten()})
-df_pred_true.plot(figsize=(12, 4))
-plt.title(model_type + ' Result')
-plt.show()
-# 将真实值和预测值合并为一个 DataFrame
-result_df = pd.DataFrame({'真实值': true.flatten(), '预测值': pred.flatten()})
-
-# 创建 result 文件夹（如果不存在）
+# --- 保存结果 ---
+# 创建 result 和 img 文件夹
 output_dir = 'result'
-if not os.path.exists(output_dir):
-    os.makedirs(output_dir)
+img_dir = os.path.join(output_dir, 'img')
+if not os.path.exists(img_dir):
+    os.makedirs(img_dir)
 
-# 生成带日期时间的文件名
+# 生成唯一时间戳
 now = datetime.now().strftime("%Y%m%d_%H%M%S")
+
+# 绘制并保存结果图
+df_pred_true = pd.DataFrame({'Predict': pred.flatten(), 'Real': true.flatten()})
+plt.figure(figsize=(12, 4))
+plt.plot(df_pred_true['Predict'], label='Predict', color='red')
+plt.plot(df_pred_true['Real'], label='Real', color='blue')
+plt.title(model_type + ' Result')
+plt.legend()
+plt.savefig(os.path.join(img_dir, f'{now}.png'))
+print(f'预测结果图已保存到 {os.path.join(img_dir, f"{now}.png")} 中。')
+plt.show()
+
+# 保存真实值和预测值到 CSV 文件
 output_filename = f'{now}.csv'
 output_path = os.path.join(output_dir, output_filename)
-
-# 保存 DataFrame 到 CSV 文件
+result_df = pd.DataFrame({'真实值': true.flatten(), '预测值': pred.flatten()})
 result_df.to_csv(output_path, index=False, encoding='utf-8')
-
-# 打印保存成功的消息
 print(f'真实值和预测值已保存到 {output_path} 文件中。')

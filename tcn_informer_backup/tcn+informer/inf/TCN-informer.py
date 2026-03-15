@@ -4,7 +4,8 @@ import matplotlib.pyplot as plt
 import os
 from datetime import datetime
 
-from sklearn.preprocessing import MinMaxScaler
+from sklearn.preprocessing import MinMaxScaler, StandardScaler
+from sklearn.decomposition import PCA
 from sklearn.metrics import r2_score, mean_squared_error, mean_absolute_error, mean_absolute_percentage_error
 
 import torch
@@ -258,9 +259,25 @@ feature_cols = [c for c in df.columns if c not in ['date', 'target']]
 df = df[['date'] + feature_cols + ['target']]
 
 # 注意多变量情况下，目标变量必须为最后一列
-data_dim = df[df.columns.drop('date')].shape[1]  # 动态计算变量总数
-data_target = df['target']  # 预测的目标变量 (全量数据中为小写)
-data = df[df.columns.drop('date')]  # 选取所有的数据
+data_target = df['target']  # 预测的目标变量
+features = df[feature_cols] # 提取特征列
+
+# --- 方向 B 优化：PCA 降维去噪 (PCA Denoising) ---
+# 1. 标准化 (Standardization): PCA 前必须进行标准化
+scaler_pca = StandardScaler()
+features_scaled = scaler_pca.fit_transform(features)
+
+# 2. 应用 PCA: 保留 95% 的方差，消除特征间的共线性
+pca = PCA(n_components=0.95) 
+features_pca = pca.fit_transform(features_scaled)
+print(f"PCA 降维完成：特征维度从 {features.shape[1]} 降至 {features_pca.shape[1]}")
+
+# 3. 合并 PCA 特征与目标变量
+data_pca = np.hstack((features_pca, data_target.values.reshape(-1, 1)))
+data = pd.DataFrame(data_pca)
+
+data_dim = data.shape[1]  # 动态更新变量总数 (主成分数 + 1个目标变量)
+data_target = data.iloc[:, -1]  # 更新目标变量引用
 
 # 时间戳
 df_stamp = df[['date']]

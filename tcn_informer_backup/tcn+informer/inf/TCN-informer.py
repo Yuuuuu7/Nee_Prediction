@@ -312,7 +312,7 @@ data_test = data_inverse[int(train_set * data_length):, :]  # 这里把训练集
 data_test_mark = data_stamp[int(train_set * data_length):, :]
 
 n_feature = data_dim
-window = 10  # 模型输入序列长度 改这里的话注意调整model-TCNInformer层的TCN模块122行必须对应
+window = 20  # 模型输入序列长度 (从 10 增加到 20 以增强历史背景感知)
 length_size = 1  # 预测结果的序列长度
 batch_size = 32
 
@@ -359,8 +359,8 @@ early_patience = 0.2  # 训练迭代的早停比例 即patience=0.25*num_epochs
 class Config:
     def __init__(self):
         # basic
-        self.seq_len = window  # input sequence length
-        self.label_len = int(window / 2)  # start token length
+        self.seq_len = window  # 输入序列长度
+        self.label_len = int(window / 2)  # 标签序列长度
         self.pred_len = length_size  # 预测序列长度
         self.freq = 'b'  # 时间的频率，
         # 模型训练
@@ -397,7 +397,7 @@ config = Config()
 model_type = 'DCATCN-TCNInformer'
 net = TCNInformer.Model(config).to(device)
 
-criterion = nn.MSELoss().to(device)  # 损失函数
+criterion = nn.MSELoss().to(device)  # 损失函数 (回归 MSE 以保证波峰捕捉力度)
 optimizer = optim.Adam(net.parameters(), lr=learning_rate)  # 优化器
 scheduler = ReduceLROnPlateau(optimizer, mode='min', factor=0.1, patience=scheduler_patience, verbose=True)  # 学习率调整策略
 

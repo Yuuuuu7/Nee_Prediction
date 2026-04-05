@@ -3,7 +3,7 @@ import numpy as np
 import matplotlib
 
 # 本地运行，保留这行以防弹窗报错
-matplotlib.use('TkAgg')
+matplotlib.use('Agg')
 import matplotlib.pyplot as plt
 import os
 from datetime import datetime
@@ -29,10 +29,10 @@ from models import PatchTST
 from utils.timefeatures import time_features
 
 # 解决画图中文显示问题
-plt.rc('font', family='Arial')
-plt.style.use("ggplot")
-plt.rcParams['font.sans-serif'] = ['SimHei']
+plt.rc('font', family='sans-serif')
+plt.rcParams['font.sans-serif'] = ['DejaVu Sans', 'Arial', 'SimHei', 'sans-serif']
 plt.rcParams['axes.unicode_minus'] = False
+plt.style.use("ggplot")
 
 
 def tslib_data_loader(window, length_size, batch_size, data, data_mark):
@@ -63,29 +63,62 @@ def tslib_data_loader(window, length_size, batch_size, data, data_mark):
     return dataloader, x_temp, y_temp, x_temp_mark, y_temp_mark
 
 
-def model_train(net, train_loader, length_size, optimizer, criterion, num_epochs, device):
+def model_train_val(net, train_loader, val_loader, length_size, optimizer, criterion, scheduler, num_epochs, device,
+                    early_patience=0.15, print_train=False):
     train_loss = []
+    val_loss = []
+    early_patience_epochs = int(early_patience * num_epochs)
+    best_val_loss = float('inf')
+    early_stop_counter = 0
+
     for epoch in range(num_epochs):
         total_train_loss = 0
         net.train()
-        loop = tqdm(train_loader, total=len(train_loader), leave=True, desc=f"Epoch [{epoch + 1}/{num_epochs}]")
+        loop = tqdm(train_loader, total=len(train_loader), leave=True, desc=f"Epoch [{epoch+1}/{num_epochs}]")
         for i, (datapoints, labels, datapoints_mark, labels_mark) in enumerate(loop):
             datapoints, labels = datapoints.to(device), labels.to(device)
-
             optimizer.zero_grad()
-            # PatchTST forward
+            
+            # PatchTST forward (encoder-only)
             preds = net(datapoints, None, None, None)
             loss = criterion(preds, labels[:, -length_size:, -1:])
             loss.backward()
             optimizer.step()
-
             total_train_loss += loss.item()
             loop.set_postfix(loss=loss.item())
 
         avg_train_loss = total_train_loss / len(train_loader)
         train_loss.append(avg_train_loss)
-        loop.set_description(f"Epoch [{epoch + 1}/{num_epochs}] Train Loss: {avg_train_loss:.4f}")
-    return net, train_loss
+
+        # 验证集
+        net.eval()
+        with torch.no_grad():
+            total_val_loss = 0
+            for val_x, val_y, val_x_mark, val_y_mark in val_loader:
+                val_x, val_y = val_x.to(device), val_y.to(device)
+                pred_val_y = net(val_x, None, None, None)
+                val_loss_batch = criterion(pred_val_y, val_y[:, -length_size:, -1:])
+                total_val_loss += val_loss_batch.item()
+
+            avg_val_loss = total_val_loss / len(val_loader)
+            val_loss.append(avg_val_loss)
+            scheduler.step(avg_val_loss)
+
+        if print_train:
+            loop.write(f"Epoch: {epoch + 1}, Train Loss: {avg_train_loss:.4f}, Val Loss: {avg_val_loss:.4f}")
+
+        if avg_val_loss < best_val_loss:
+            best_val_loss = avg_val_loss
+            early_stop_counter = 0
+            torch.save(net.state_dict(), 'patchtst_checkpoint.pth')
+        else:
+            early_stop_counter += 1
+            if early_stop_counter >= early_patience_epochs:
+                loop.write(f'Early stopping triggered at epoch {epoch + 1}.')
+                break
+
+    net.load_state_dict(torch.load('patchtst_checkpoint.pth'))
+    return net, train_loss, val_loss, epoch + 1
 
 
 def cal_eval(y_real, y_pred):
@@ -149,46 +182,34 @@ df_stamp = df[['date']].copy()
 df_stamp['date'] = pd.to_datetime(df_stamp['date'])
 data_stamp = time_features(df_stamp, timeenc=1, freq='h')
 
-data_length = len(df)
-train_set = 0.8
-train_size = int(train_set * data_length)
-
-features_train = features[:train_size, :]
-features_test = features[train_size:, :]
-target_train = data_target[:train_size, :]
-target_test = data_target[train_size:, :]
-data_stamp_train = data_stamp[:train_size, :]
-data_stamp_test = data_stamp[train_size:, :]
-
-scaler_pca = StandardScaler()
-features_train_scaled = scaler_pca.fit_transform(features_train)
-features_test_scaled = scaler_pca.transform(features_test)
-
-pca = PCA(n_components=0.95)
-features_train_pca = pca.fit_transform(features_train_scaled)
-features_test_pca = pca.transform(features_test_scaled)
-
-data_train_raw = np.concatenate((features_train_pca, target_train), axis=1)
-data_test_raw = np.concatenate((features_test_pca, target_test), axis=1)
+# 数据合并与归一化 (禁用 PCA，统一特征)
+data_full = np.concatenate((features, data_target), axis=1) # 18特征+1目标
+data_length = len(data_full)
+train_ratio, val_ratio = 0.6, 0.8
+train_size = int(train_ratio * data_length)
+val_size = int(val_ratio * data_length)
 
 scaler = MinMaxScaler()
-data_train = scaler.fit_transform(data_train_raw)
-data_test = scaler.transform(data_test_raw)
+data_inverse = scaler.fit_transform(data_full)
 
-data_train_mark = data_stamp_train
-data_test_mark = data_stamp_test
-data_dim = data_train.shape[1]
+data_train = data_inverse[:train_size, :]
+data_train_mark = data_stamp[:train_size, :]
+data_val = data_inverse[train_size: val_size, :]
+data_val_mark = data_stamp[train_size: val_size, :]
+data_test = data_inverse[val_size:, :]
+data_test_mark = data_stamp[val_size:, :]
 
 window = 96
 length_size = 48
 batch_size = 128
-num_epochs = 100
+device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+num_epochs = 80
 learning_rate = 0.0001
 
-train_loader, x_train, y_train, x_train_mark, y_train_mark = tslib_data_loader(window, length_size, batch_size,
-                                                                               data_train, data_train_mark)
-test_loader, x_test, y_test, x_test_mark, y_test_mark = tslib_data_loader(window, length_size, batch_size, data_test,
-                                                                          data_test_mark)
+# 准备 DataLoader
+train_loader, _, _, _, _ = tslib_data_loader(window, length_size, batch_size, data_train, data_train_mark)
+val_loader, _, _, _, _ = tslib_data_loader(window, length_size, batch_size, data_val, data_val_mark)
+test_loader, _, _, _, _ = tslib_data_loader(window, length_size, batch_size, data_test, data_test_mark)
 
 device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 
@@ -196,6 +217,9 @@ device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 # ==========================================
 # 配置参数：严格对齐消融实验
 # ==========================================
+# 配置参数
+data_dim = data_inverse.shape[1]
+
 class Config:
     def __init__(self):
         self.enc_in = data_dim
@@ -213,13 +237,13 @@ config = Config()
 model_type = 'Baseline_PatchTST'
 net = PatchTST.Model(config).to(device)
 
-criterion = nn.MSELoss().to(device)
-optimizer = optim.Adam(net.parameters(), lr=learning_rate)
+# 学习率调度器
+scheduler = ReduceLROnPlateau(optimizer, mode='min', factor=0.5, patience=5)
 
-# ==========================================
-# 训练与预测
-# ==========================================
-trained_model, train_loss = model_train(net, train_loader, length_size, optimizer, criterion, num_epochs, device)
+# 训练与预测 (采用统一模式)
+trained_model, train_loss, val_loss, final_epoch = model_train_val(net, train_loader, val_loader, length_size, 
+                                                                    optimizer, criterion, scheduler, num_epochs, 
+                                                                    device, print_train=True)
 
 trained_model.eval()
 preds = []

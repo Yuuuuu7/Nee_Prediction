@@ -17,7 +17,8 @@ plt.rcParams['font.size'] = 12
 # 1. 自动搜索并按数据集分类实验结果
 # ==========================================
 result_root = 'result'
-target_models = ['Informer', 'Ablation_TCN', 'Baseline_PatchTST', 'LightGBM', 'LSTM', 'TCN_Informer']
+# 定义你想对比的模型关键词
+target_models = ['Informer', 'Ablation_TCN', 'Baseline_PatchTST', 'LightGBM', 'LSTM', 'TCN_Informer', 'SOTA_ExoTST']
 target_datasets = ['DT', 'SX']  # 明确区分两个数据集
 
 summary_data = []

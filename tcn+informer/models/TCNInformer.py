@@ -2,8 +2,57 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from layers.Transformer_EncDec import Decoder, DecoderLayer, Encoder, EncoderLayer, ConvLayer
-from layers.SelfAttention_Family import ProbAttention, AttentionLayer
+from layers.SelfAttention_Family import ProbAttention, FullAttention, AttentionLayer
 from layers.Embed import DataEmbedding
+
+class RevIN(nn.Module):
+    def __init__(self, num_features: int, eps=1e-5, affine=True):
+        """
+        :param num_features: the number of features or channels
+        :param eps: a value added for numerical stability
+        :param affine: if True, RevIN has learnable affine parameters
+        """
+        super(RevIN, self).__init__()
+        self.num_features = num_features
+        self.eps = eps
+        self.affine = affine
+        if self.affine:
+            self._init_params()
+
+    def forward(self, x, mode:str):
+        if mode == 'norm':
+            self._get_statistics(x)
+            x = self._normalize(x)
+        elif mode == 'denorm':
+            x = self._denormalize(x)
+        else: raise NotImplementedError
+        return x
+
+    def _init_params(self):
+        # initialize revin affine parameters
+        self.affine_weight = nn.Parameter(torch.ones(self.num_features))
+        self.affine_bias = nn.Parameter(torch.zeros(self.num_features))
+
+    def _get_statistics(self, x):
+        dim2reduce = tuple(range(1, x.ndim-1))
+        self.mean = torch.mean(x, dim=dim2reduce, keepdim=True).detach()
+        self.stdev = torch.sqrt(torch.var(x, dim=dim2reduce, keepdim=True, unbiased=False) + self.eps).detach()
+
+    def _normalize(self, x):
+        x = x - self.mean
+        x = x / self.stdev
+        if self.affine:
+            x = x * self.affine_weight
+            x = x + self.affine_bias
+        return x
+
+    def _denormalize(self, x):
+        if self.affine:
+            x = x - self.affine_bias
+            x = x / self.affine_weight
+        x = x * self.stdev
+        x = x + self.mean
+        return x
 
 class TemporalBlock(nn.Module):
     def __init__(self, n_inputs, n_outputs, kernel_size, stride, dilation, padding, dropout=0.2):
@@ -28,7 +77,7 @@ class TCN(nn.Module):
         self.hidden_size = hidden_size
         self.num_layers = num_layers
         self.batch_size = batch_size
-        kernel_size = 3  # ¶¨Òå¾í»ıºË´óĞ¡
+        kernel_size = 5  # V3: å¢åŠ å·ç§¯æ ¸ï¼Œæ•æ‰æ›´å¹¿è§†é‡
         self.tcn_layers = nn.ModuleList()
         num_channels = [self.input_size] + [self.hidden_size] * (self.num_layers - 1) + [self.hidden_size]
 
@@ -44,11 +93,11 @@ class TCN(nn.Module):
     def forward(self, x_enc):
         batch_size, seq_len = x_enc.shape[0], x_enc.shape[1]  # batch_size=32, seq_len=30, hidden_size=64
 
-        x_enc = x_enc.permute(0, 2, 1)  # ±ä»»Îª [batch_size, input_size, seq_len]
+        x_enc = x_enc.permute(0, 2, 1)  # å˜æ¢ä¸º [batch_size, input_size, seq_len]
         for layer in self.tcn_layers:
             x_enc = layer(x_enc)
 
-        x_enc = x_enc.permute(0, 2, 1)  # ±ä»Ø [batch_size, seq_len, hidden_size]
+        x_enc = x_enc.permute(0, 2, 1)  # å˜å› [batch_size, seq_len, hidden_size]
         return x_enc  # torch.Size([batch_size, seq_len, hidden_size])
 
 
@@ -63,20 +112,27 @@ class Model(nn.Module):
         self.task_name = configs.task_name
         self.pred_len = configs.pred_len
         self.label_len = configs.label_len
-        self.tcn = TCN(input_size=configs.enc_in, hidden_size=configs.enc_in, num_layers=2,
-                       batch_size=configs.batch_size) #ÉùÃ÷TCNÄ£¿é
+        
+        # å¼•å…¥ RevIN è§£å†³éå¹³ç¨³æ€§ (å½’ä¸€åŒ–/åå½’ä¸€åŒ–)
+        self.revin_layer = RevIN(configs.enc_in, affine=True)
+        
+        # æ·±åº¦ TCN (V6: ç¨³å®š 4 å±‚ï¼Œæ„Ÿå—é‡çº¦ 30.5 å°æ—¶)
+        self.tcn = TCN(input_size=configs.enc_in, hidden_size=configs.enc_in, 
+                       num_layers=4, batch_size=configs.batch_size) #å£°æ˜TCNæ¨¡å—
         # Embedding
+        # V3: æ”¯æŒå¤šç»´æ—¶é—´ç‰¹å¾ (å¦‚ 8 ç»´ Sin/Cos)
+        time_dims = getattr(configs, 'time_dims', None)
         self.enc_embedding = DataEmbedding(configs.enc_in, configs.d_model, configs.embed, configs.freq,
-                                           configs.dropout)
+                                           configs.dropout, time_dims=time_dims)
         self.dec_embedding = DataEmbedding(configs.dec_in, configs.d_model, configs.embed, configs.freq,
-                                           configs.dropout)
+                                           configs.dropout, time_dims=time_dims)
 
         # Encoder
         self.encoder = Encoder(
             [
                 EncoderLayer(
                     AttentionLayer(
-                        ProbAttention(False, configs.factor, attention_dropout=configs.dropout,
+                        FullAttention(False, configs.factor, attention_dropout=configs.dropout,
                                       output_attention=configs.output_attention),
                         configs.d_model, configs.n_heads),
                     configs.d_model,
@@ -97,10 +153,10 @@ class Model(nn.Module):
             [
                 DecoderLayer(
                     AttentionLayer(
-                        ProbAttention(True, configs.factor, attention_dropout=configs.dropout, output_attention=False),
+                        FullAttention(True, configs.factor, attention_dropout=configs.dropout, output_attention=False),
                         configs.d_model, configs.n_heads),
                     AttentionLayer(
-                        ProbAttention(False, configs.factor, attention_dropout=configs.dropout, output_attention=False),
+                        FullAttention(False, configs.factor, attention_dropout=configs.dropout, output_attention=False),
                         configs.d_model, configs.n_heads),
                     configs.d_model,
                     configs.d_ff,
@@ -131,19 +187,24 @@ class Model(nn.Module):
         return dec_out  # [B, L, D]
 
     def short_forecast(self, x_enc, x_mark_enc, x_dec, x_mark_dec):
-        # Normalization
-        mean_enc = x_enc.mean(1, keepdim=True).detach()  # B x 1 x E
-        x_enc = x_enc - mean_enc
-        std_enc = torch.sqrt(torch.var(x_enc, dim=1, keepdim=True, unbiased=False) + 1e-5).detach()  # B x 1 x E
-        x_enc = x_enc / std_enc
-        x_enc = self.tcn(x_enc)#¾­¹ıtcnÍøÂçµÄÌØÕ÷´¦Àí£¬´®ÁªÊäÈëµ½informerÀïÃæÈ¥
+        # --- RevIN å½’ä¸€åŒ– (æ ¸å¿ƒä¿®å¤ï¼šç»Ÿè®¡é‡ç”± x_enc å”¯ä¸€ç¡®å®š) ---
+        self.revin_layer._get_statistics(x_enc)
+        x_enc = self.revin_layer._normalize(x_enc)
+        x_dec = self.revin_layer._normalize(x_dec)
+        
+        # enc
+        x_enc = self.tcn(x_enc) # ç»è¿‡ TCN æå–ç‰©ç†ç‰¹å¾
         enc_out = self.enc_embedding(x_enc, x_mark_enc)
+        
+        # dec
         dec_out = self.dec_embedding(x_dec, x_mark_dec)
         enc_out, attns = self.encoder(enc_out, attn_mask=None)
 
         dec_out = self.decoder(dec_out, enc_out, x_mask=None, cross_mask=None)
+        
+        # --- RevIN åå½’ä¸€åŒ– ---
+        dec_out = self.revin_layer._denormalize(dec_out)
 
-        dec_out = dec_out * std_enc + mean_enc
         return dec_out  # [B, L, D]
 
     def imputation(self, x_enc, x_mark_enc, x_dec, x_mark_dec, mask):

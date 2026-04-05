@@ -1,7 +1,7 @@
 import pandas as pd
 import numpy as np
 import matplotlib
-matplotlib.use('TkAgg') # <--- 加上这一行，强制使用独立的弹窗显示图片
+matplotlib.use('Agg') # <--- 加上这一行，强制使用独立的弹窗显示图片
 import matplotlib.pyplot as plt
 import os
 from datetime import datetime
@@ -12,10 +12,10 @@ from sklearn.decomposition import PCA
 from sklearn.metrics import r2_score, mean_squared_error, mean_absolute_error, mean_absolute_percentage_error
 from tqdm import tqdm
 
-plt.rc('font', family='Arial')
-plt.style.use("ggplot")
-plt.rcParams['font.sans-serif'] = ['SimHei']
+plt.rc('font', family='sans-serif')
+plt.rcParams['font.sans-serif'] = ['DejaVu Sans', 'Arial', 'SimHei', 'sans-serif']
 plt.rcParams['axes.unicode_minus'] = False
+plt.style.use("ggplot")
 
 
 # ==========================================

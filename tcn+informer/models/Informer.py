@@ -10,6 +10,11 @@ class Model(nn.Module):
     """
     Informer with Propspare attention in O(LlogL) complexity
     Paper link: https://ojs.aaai.org/index.php/AAAI/article/view/17325/17132
+
+    Important: For time series forecasting, the decoder input (x_dec) should consist of:
+    1. Label Token: The last L_label steps of the historical data (x_enc).
+    2. Future Placeholders: L_pred steps where the target variable (e.g., NEE) is set to 0.
+       Passing ground truth values to the target column of x_dec during inference will cause data leakage.
     """
 
     def __init__(self, configs):
@@ -84,19 +89,14 @@ class Model(nn.Module):
         return dec_out  # [B, L, D]
 
     def short_forecast(self, x_enc, x_mark_enc, x_dec, x_mark_dec):
-        # Normalization
-        mean_enc = x_enc.mean(1, keepdim=True).detach()  # B x 1 x E
-        x_enc = x_enc - mean_enc
-        std_enc = torch.sqrt(torch.var(x_enc, dim=1, keepdim=True, unbiased=False) + 1e-5).detach()  # B x 1 x E
-        x_enc = x_enc / std_enc
-
+        # enc
         enc_out = self.enc_embedding(x_enc, x_mark_enc)
-        dec_out = self.dec_embedding(x_dec, x_mark_dec)
         enc_out, attns = self.encoder(enc_out, attn_mask=None)
 
+        # dec
+        dec_out = self.dec_embedding(x_dec, x_mark_dec)
         dec_out = self.decoder(dec_out, enc_out, x_mask=None, cross_mask=None)
 
-        dec_out = dec_out * std_enc + mean_enc
         return dec_out  # [B, L, D]
 
     def imputation(self, x_enc, x_mark_enc, x_dec, x_mark_dec, mask):

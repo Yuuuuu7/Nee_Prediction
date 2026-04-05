@@ -2,7 +2,7 @@ import pandas as pd
 import numpy as np
 import matplotlib
 # 如果画图报错或者不弹窗，请取消注释下面这行代码
-matplotlib.use('TkAgg')
+matplotlib.use('Agg')
 import matplotlib.pyplot as plt
 import os
 from datetime import datetime
@@ -22,7 +22,7 @@ import torch.optim as optim
 from torch.optim.lr_scheduler import ReduceLROnPlateau
 from torch.utils.data import DataLoader, TensorDataset
 
-plt.rc('font', family='Arial')
+plt.rc('font', family='sans-serif')
 plt.style.use("ggplot")
 
 # ==========================================
@@ -68,22 +68,31 @@ def tslib_data_loader(window, length_size, batch_size, data, data_mark):
     return dataloader, x_temp, y_temp, x_temp_mark, y_temp_mark
 
 
-def model_train(net, train_loader, length_size, optimizer, criterion, num_epochs, device, print_train=False):
+def model_train_val(net, train_loader, val_loader, length_size, optimizer, criterion, scheduler, num_epochs, device,
+                    early_patience=0.15, print_train=False):
     train_loss = []
-    print_frequency = 1
+    val_loss = []
+    early_patience_epochs = int(early_patience * num_epochs)
+    best_val_loss = float('inf')
+    early_stop_counter = 0
 
     for epoch in range(num_epochs):
         total_train_loss = 0
-
         net.train()
-        loop = tqdm(train_loader, total=len(train_loader), leave=True, desc=f"Epoch [{epoch + 1}/{num_epochs}]")
+        loop = tqdm(train_loader, total=len(train_loader), leave=True, desc=f"Epoch [{epoch+1}/{num_epochs}]")
         for i, (datapoints, labels, datapoints_mark, labels_mark) in enumerate(loop):
             datapoints, labels, datapoints_mark, labels_mark = datapoints.to(device), labels.to(
                 device), datapoints_mark.to(device), labels_mark.to(device)
             optimizer.zero_grad()
-            preds = net(datapoints, datapoints_mark, labels, labels_mark, None)
+            
+            # --- 核心改进：同步训练掩码 ---
+            labels_masked = labels.clone()
+            labels_masked[:, -length_size:, -1] = 0
+            
+            preds = net(datapoints, datapoints_mark, labels_masked, labels_mark, None)
             preds = preds[:, -length_size:, -1:]
             labels = labels[:, -length_size:, -1:]
+            
             loss = criterion(preds, labels)
             loss.backward()
             optimizer.step()
@@ -93,12 +102,43 @@ def model_train(net, train_loader, length_size, optimizer, criterion, num_epochs
         avg_train_loss = total_train_loss / len(train_loader)
         train_loss.append(avg_train_loss)
 
-        if print_train:
-            if (epoch + 1) % print_frequency == 0:
-                loop.write(f"Epoch: {epoch + 1}, Train Loss: {avg_train_loss:.4f}")
-                #print(f"Epoch: {epoch + 1}, Train Loss: {avg_train_loss:.4f}")
+        # 验证集
+        net.eval()
+        with torch.no_grad():
+            total_val_loss = 0
+            for val_x, val_y, val_x_mark, val_y_mark in val_loader:
+                val_x, val_y, val_x_mark, val_y_mark = val_x.to(device), val_y.to(device), val_x_mark.to(
+                    device), val_y_mark.to(device)
+                
+                val_y_masked = val_y.clone()
+                val_y_masked[:, -length_size:, -1] = 0
+                
+                pred_val_y = net(val_x, val_x_mark, val_y_masked, val_y_mark, None)
+                pred_val_y = pred_val_y[:, -length_size:, -1:]
+                val_y_true = val_y[:, -length_size:, -1:]
+                
+                val_loss_batch = criterion(pred_val_y, val_y_true)
+                total_val_loss += val_loss_batch.item()
 
-    return net, train_loss, epoch + 1
+            avg_val_loss = total_val_loss / len(val_loader)
+            val_loss.append(avg_val_loss)
+            scheduler.step(avg_val_loss)
+
+        if print_train:
+            loop.write(f"Epoch: {epoch + 1}, Train Loss: {avg_train_loss:.4f}, Val Loss: {avg_val_loss:.4f}")
+
+        if avg_val_loss < best_val_loss:
+            best_val_loss = avg_val_loss
+            early_stop_counter = 0
+            torch.save(net.state_dict(), 'informer_checkpoint.pth')
+        else:
+            early_stop_counter += 1
+            if early_stop_counter >= early_patience_epochs:
+                loop.write(f'Early stopping triggered at epoch {epoch + 1}.')
+                break
+
+    net.load_state_dict(torch.load('informer_checkpoint.pth'))
+    return net, train_loss, val_loss, epoch + 1
 
 
 def cal_eval(y_real, y_pred):
@@ -173,61 +213,42 @@ data_stamp = time_features(df_stamp, timeenc=1, freq='h')
 print("时间特征编码完成...")
 
 # 严格切分训练集与测试集防止泄露
-data_length = len(df)
-train_set = 0.8
-train_size = int(train_set * data_length)
-
-features_train = features[:train_size, :]
-features_test = features[train_size:, :]
-target_train = data_target[:train_size, :]
-target_test = data_target[train_size:, :]
-data_stamp_train = data_stamp[:train_size, :]
-data_stamp_test = data_stamp[train_size:, :]
-print("训练/测试集切分完成...")
-
-# PCA 降维
-print("开始进行数据标准化与 PCA 降维...")
-scaler_pca = StandardScaler()
-features_train_scaled = scaler_pca.fit_transform(features_train)
-features_test_scaled = scaler_pca.transform(features_test)
-
-pca = PCA(n_components=0.95)
-features_train_pca = pca.fit_transform(features_train_scaled)
-features_test_pca = pca.transform(features_test_scaled)
-print(f"PCA 降维完成：特征维度从 {features_train.shape[1]} 降至 {features_train_pca.shape[1]}")
-
-data_train_raw = np.concatenate((features_train_pca, target_train), axis=1)
-data_test_raw = np.concatenate((features_test_pca, target_test), axis=1)
+# 数据合并与归一化
+data_full = np.concatenate((features, data_target), axis=1) # 18特征+1目标
+data_length = len(data_full)
+train_ratio, val_ratio = 0.6, 0.8
+train_size = int(train_ratio * data_length)
+val_size = int(val_ratio * data_length)
 
 scaler = MinMaxScaler()
-data_train = scaler.fit_transform(data_train_raw)
-data_test = scaler.transform(data_test_raw)
+data_inverse = scaler.fit_transform(data_full)
 
-data_train_mark = data_stamp_train
-data_test_mark = data_stamp_test
-data_dim = data_train.shape[1]
+data_train = data_inverse[:train_size, :]
+data_train_mark = data_stamp[:train_size, :]
+data_val = data_inverse[train_size: val_size, :]
+data_val_mark = data_stamp[train_size: val_size, :]
+data_test = data_inverse[val_size:, :]
+data_test_mark = data_stamp[val_size:, :]
 
-n_feature = data_dim
 window = 96
 length_size = 48
 batch_size = 128
-
-print("准备封装 PyTorch DataLoader...")
-train_loader, x_train, y_train, x_train_mark, y_train_mark = tslib_data_loader(window, length_size, batch_size,
-                                                                               data_train, data_train_mark)
-print("训练集 DataLoader 封装完成...")
-test_loader, x_test, y_test, x_test_mark, y_test_mark = tslib_data_loader(window, length_size, batch_size, data_test,
-                                                                          data_test_mark)
-print("测试集 DataLoader 封装完成...")
-
 device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-num_epochs = 100
+num_epochs = 80
 learning_rate = 0.0001
+
+# 准备 DataLoader
+train_loader, _, _, _, _ = tslib_data_loader(window, length_size, batch_size, data_train, data_train_mark)
+val_loader, _, _, _, _ = tslib_data_loader(window, length_size, batch_size, data_val, data_val_mark)
+test_loader, _, _, _, _ = tslib_data_loader(window, length_size, batch_size, data_test, data_test_mark)
 
 
 # ==========================================
 # 核心修改 2：适配 Informer 的超参数配置
 # ==========================================
+# 配置参数
+data_dim = data_inverse.shape[1]
+
 class Config:
     def __init__(self):
         self.seq_len = window
@@ -278,12 +299,15 @@ config = Config()
 model_type = 'Ablation_Informer'
 net = Informer.Model(config).to(device)
 
+# 优化器与调度器
 criterion = nn.MSELoss().to(device)
 optimizer = optim.Adam(net.parameters(), lr=learning_rate)
+scheduler = ReduceLROnPlateau(optimizer, mode='min', factor=0.5, patience=5)
 
-# 模型训练
-trained_model, train_loss, final_epoch = model_train(net, train_loader, length_size, optimizer, criterion, num_epochs,
-                                                     device, print_train=True)
+# 模型训练 (统一使用 model_train_val)
+trained_model, train_loss, val_loss, final_epoch = model_train_val(net, train_loader, val_loader, length_size, 
+                                                                    optimizer, criterion, scheduler, num_epochs,
+                                                                    device, print_train=True)
 
 trained_model.eval()
 preds = []
@@ -291,7 +315,14 @@ trues = []
 with torch.no_grad():
     for x, y, x_mark, y_mark in test_loader:
         x, y, x_mark, y_mark = x.to(device), y.to(device), x_mark.to(device), y_mark.to(device)
-        outputs = trained_model(x, x_mark, y, y_mark)
+        
+        # --- 核心改进：解决数据泄露问题 ---
+        # 构造公平的解码器输入：将 y 中的预测部分 (后 length_size 步) 的目标列 (最后一列) 清零
+        # 这样模型在预测时只能看到未来的外生变量（特征），无法通过输入直接看到 NEE 答案
+        y_masked = y.clone()
+        y_masked[:, -length_size:, -1] = 0  
+        
+        outputs = trained_model(x, x_mark, y_masked, y_mark)
         preds.append(outputs.detach().cpu().numpy())
         trues.append(y[:, -length_size:, -1:].detach().cpu().numpy())
 
@@ -301,10 +332,13 @@ true = np.concatenate(trues, axis=0)
 true = true[:, :, -1]
 pred = pred[:, :, -1]
 
-# 更新 scaler 以适应一维的反归一化逻辑
-y_data_test_inverse = scaler.fit_transform(np.array(data_target).reshape(-1, 1))
-pred_uninverse = scaler.inverse_transform(pred[:, -1:])
-true_uninverse = scaler.inverse_transform(true[:, -1:])
+# --- 改进：Scaler 只在训练集上 fit ---
+# 重新定义一个针对目标列的 Scaler，确保不利用测试集的极值信息
+target_scaler = MinMaxScaler()
+target_scaler.fit(target_train) 
+
+pred_uninverse = target_scaler.inverse_transform(pred[:, -1:])
+true_uninverse = target_scaler.inverse_transform(true[:, -1:])
 
 true, pred = true_uninverse, pred_uninverse
 

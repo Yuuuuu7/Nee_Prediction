@@ -2,7 +2,7 @@ import pandas as pd
 import numpy as np
 import matplotlib
 # 如果画图报错或者不弹窗，请取消注释下面这行代码
-matplotlib.use('TkAgg')
+matplotlib.use('Agg')
 import matplotlib.pyplot as plt
 import os
 from datetime import datetime
@@ -28,7 +28,7 @@ from models import TCN
 from utils.timefeatures import time_features
 
 # 解决画图中文显示问题
-plt.rc('font', family='Arial')
+plt.rc('font', family='sans-serif')
 plt.style.use("ggplot")
 plt.rcParams['font.sans-serif'] = ['SimHei']
 plt.rcParams['axes.unicode_minus'] = False

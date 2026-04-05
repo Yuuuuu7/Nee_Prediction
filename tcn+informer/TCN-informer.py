@@ -18,7 +18,9 @@ import torch.optim as optim
 from torch.optim.lr_scheduler import ReduceLROnPlateau
 from torch.utils.data import DataLoader, TensorDataset
 
-plt.rc('font', family='Arial')
+plt.rc('font', family='sans-serif')
+plt.rcParams['font.sans-serif'] = ['DejaVu Sans', 'Arial', 'SimHei', 'sans-serif']
+plt.rcParams['axes.unicode_minus'] = False
 plt.style.use("ggplot")
 # 自己写的函数文件functionfile.py
 # 如果需要调整TSlib-test.ipynb文件的路径位置 注意同时调整导入的路径
@@ -117,9 +119,15 @@ def model_train(net, train_loader, length_size, optimizer, criterion, num_epochs
         for i, (datapoints, labels, datapoints_mark, labels_mark) in enumerate(loop):
             datapoints, labels, datapoints_mark, labels_mark = datapoints.to(device), labels.to(
                 device), datapoints_mark.to(device), labels_mark.to(device)
-            optimizer.zero_grad()  # 清空梯度
-            preds = net(datapoints, datapoints_mark, labels, labels_mark, None)  # 前向传播
-            preds = preds[:, -length_size:, -1:] # 仅取目标变量通道
+            optimizer.zero_grad()
+            
+            # --- 核心改进：同步训练掩码 ---
+            # 训练阶段也必须遮蔽未来的目标变量，防止模型学会“复制”逻辑
+            labels_masked = labels.clone()
+            labels_masked[:, -length_size:, -1] = 0
+            
+            preds = net(datapoints, datapoints_mark, labels_masked, labels_mark, None)
+            preds = preds[:, -length_size:, -1:]
             labels = labels[:, -length_size:, -1:] # 仅取目标变量通道
             loss = criterion(preds, labels)  # 计算损失
             loss.backward()  # 反向传播
@@ -140,87 +148,77 @@ def model_train(net, train_loader, length_size, optimizer, criterion, num_epochs
 
 def model_train_val(net, train_loader, val_loader, length_size, optimizer, criterion, scheduler, num_epochs, device,
                     early_patience=0.15, print_train=False):
-    """
-    训练模型并应用早停机制。
+    train_loss = []
+    val_loss = []
+    print_frequency = 1
 
-    参数:
-        model (torch.nn.Module): 待训练的模型。
-        train_loader (torch.utils.data.DataLoader): 训练数据加载器。
-        val_loader (torch.utils.data.DataLoader): 验证数据加载器。
-        optimizer (torch.optim.Optimizer): 优化器。
-        criterion (torch.nn.Module): 损失函数。
-        scheduler (torch.optim.lr_scheduler._LRScheduler): 学习率调度器。
-        num_epochs (int): 总训练轮数。
-        device (torch.device): 设备（CPU或GPU）。
-        early_patience (float, optional): 早停耐心值，默认为0.15 * num_epochs。
-        print_train: 是否打印训练信息。
-    返回:
-        torch.nn.Module: 训练好的模型。
-        list: 训练过程中每个epoch的平均训练损失列表。
-        list: 训练过程中每个epoch的平均验证损失列表。
-        int: 早停触发时的epoch数。
-    """
-
-    train_loss = []  # 用于记录每个epoch的平均损失
-    val_loss = []  # 用于记录验证集上的损失，用于早停判断
-    print_frequency = 1 #num_epochs / 20  # 计算打印频率
-
-    early_patience_epochs = int(early_patience * num_epochs)  # 早停耐心值（转换为epoch数）
-    best_val_loss = float('inf')  # 初始化最佳验证集损失
-    early_stop_counter = 0  # 早停计数器
+    early_patience_epochs = int(early_patience * num_epochs)
+    best_val_loss = float('inf')
+    early_stop_counter = 0
 
     for epoch in range(num_epochs):
-        total_train_loss = 0  # 初始化一个epoch的总损失
-
-        net.train()  # 将模型设置为训练模式
+        total_train_loss = 0
+        net.train()
         loop = tqdm(train_loader, total=len(train_loader), leave=True, desc=f"Epoch [{epoch+1}/{num_epochs}]")
         for i, (datapoints, labels, datapoints_mark, labels_mark) in enumerate(loop):
-            datapoints, labels, datapoints_mark, labels_mark = datapoints.to(
-                device), labels.to(device), datapoints_mark.to(device), labels_mark.to(device)
-            optimizer.zero_grad()  # 清空梯度
-            preds = net(datapoints, datapoints_mark, labels, labels_mark, None)
-            preds = preds[:, -length_size:, -1:] # 仅取目标变量通道
-            labels = labels[:, -length_size:, -1:] # 仅取目标变量通道
-            loss = criterion(preds, labels)  # 计算损失
-            loss.backward()  # 反向传播
-            optimizer.step()  # 更新模型参数
-            total_train_loss += loss.item()  # 累加损失值
+            datapoints, labels, datapoints_mark, labels_mark = datapoints.to(device), labels.to(
+                device), datapoints_mark.to(device), labels_mark.to(device)
+            optimizer.zero_grad()
+            
+            # --- 核心改进：同步训练掩码 ---
+            labels_masked = labels.clone()
+            labels_masked[:, -length_size:, -1] = 0
+            
+            preds = net(datapoints, datapoints_mark, labels_masked, labels_mark, None)
+            preds = preds[:, -length_size:, -1:]
+            labels = labels[:, -length_size:, -1:]
+            
+            loss = criterion(preds, labels)
+            loss.backward()
+            optimizer.step()
+            total_train_loss += loss.item()
             loop.set_postfix(loss=loss.item())
 
-        avg_train_loss = total_train_loss / len(train_loader)  # 计算本epoch的平均损失
-        train_loss.append(avg_train_loss)  # 记录平均损失
+        avg_train_loss = total_train_loss / len(train_loader)
+        train_loss.append(avg_train_loss)
 
-        with torch.no_grad():  # 关闭自动求导以节省内存和提高效率
+        # 验证环节
+        net.eval()
+        with torch.no_grad():
             total_val_loss = 0
             for val_x, val_y, val_x_mark, val_y_mark in val_loader:
                 val_x, val_y, val_x_mark, val_y_mark = val_x.to(device), val_y.to(device), val_x_mark.to(
-                    device), val_y_mark.to(device)  # 将数据移到GPU
-                pred_val_y = net(val_x, val_x_mark, val_y, val_y_mark, None).squeeze()  # 前向传播
-                val_y = val_y[:, -length_size:].squeeze()  # 注意这一步
-                val_loss_batch = criterion(pred_val_y, val_y)  # 计算损失
+                    device), val_y_mark.to(device)
+                
+                # --- 核心改进：验证集也要掩码 ---
+                val_y_masked = val_y.clone()
+                val_y_masked[:, -length_size:, -1] = 0
+                
+                pred_val_y = net(val_x, val_x_mark, val_y_masked, val_y_mark, None)
+                pred_val_y = pred_val_y[:, -length_size:, -1:]
+                val_y_true = val_y[:, -length_size:, -1:]
+                
+                val_loss_batch = criterion(pred_val_y, val_y_true)
                 total_val_loss += val_loss_batch.item()
 
-            avg_val_loss = total_val_loss / len(val_loader)  # 计算本epoch的平均验证损失
-            val_loss.append(avg_val_loss)  # 记录平均验证损失
+            avg_val_loss = total_val_loss / len(val_loader)
+            val_loss.append(avg_val_loss)
+            scheduler.step(avg_val_loss)
 
-            scheduler.step(avg_val_loss)  # 更新学习率（基于当前验证损失）
+        if print_train:
+            loop.write(f"Epoch: {epoch + 1}, Train Loss: {avg_train_loss:.4f}, Val Loss: {avg_val_loss:.4f}")
 
-        # 打印训练信息
-        if print_train == True:
-            if (epoch + 1) % print_frequency == 0:
-                print(f"Epoch: {epoch + 1}, Train Loss: {avg_train_loss:.4f}, Val Loss: {avg_val_loss:.4f}")
-
-        # 早停判断
         if avg_val_loss < best_val_loss:
             best_val_loss = avg_val_loss
-            early_stop_counter = 0  # 重置早停计数器
+            early_stop_counter = 0
+            torch.save(net.state_dict(), 'checkpoint.pth') # 保存最佳模型
         else:
             early_stop_counter += 1
             if early_stop_counter >= early_patience_epochs:
-                print(f'Early stopping triggered at epoch {epoch + 1}.')
-                break  # 早停
+                loop.write(f'Early stopping triggered at epoch {epoch + 1}.')
+                break
 
-    net.train()  # 恢复训练模式
+    net.load_state_dict(torch.load('checkpoint.pth')) # 加载最佳模型
     return net, train_loss, val_loss, epoch + 1
 
 
@@ -322,6 +320,20 @@ print("特征和目标变量提取完成，准备时间特征编码...")
 df_stamp = df[['date']].copy()
 df_stamp['date'] = pd.to_datetime(df_stamp['date'])
 data_stamp = time_features(df_stamp, timeenc=1, freq='h')
+
+# --- V3: 增加正余弦周期编码 (Sin/Cos Encoding) ---
+# data_stamp 原有: [HourOfDay, DayOfWeek, DayOfMonth, DayOfYear]
+# 我们为核心周期 (Hour, Day) 增加周期性表达
+hour_rad = (df_stamp['date'].dt.hour / 23.0) * 2 * np.pi
+day_rad = (df_stamp['date'].dt.dayofyear / 365.0) * 2 * np.pi
+
+sin_cos_features = np.stack([
+    np.sin(hour_rad), np.cos(hour_rad),
+    np.sin(day_rad), np.cos(day_rad)
+], axis=1)
+
+data_stamp = np.concatenate([data_stamp, sin_cos_features], axis=1)
+print(f"时间特征扩充完成 (Sin/Cos): {data_stamp.shape}")
 print("时间特征编码完成...")
 
 # ==========================================
@@ -347,16 +359,13 @@ scaler_pca = StandardScaler()
 features_train_scaled = scaler_pca.fit_transform(features_train)
 features_test_scaled = scaler_pca.transform(features_test) 
 
-# 2. PCA降维：【同样，PCA 主成分网络绝不泄露给测试集】
-pca = PCA(n_components=0.95) 
-features_train_pca = pca.fit_transform(features_train_scaled)
-features_test_pca = pca.transform(features_test_scaled)    
-print(f"PCA 降维完成：特征维度从 {features_train.shape[1]} 降至 {features_train_pca.shape[1]}")
+# 数据标准化完成
+print(f"数据标准化完成：使用全部 {features_train_scaled.shape[1]} 维特征。")
 
 # 3. 将 PCA 过滤后的特征和原本的目标变量重新拼接成网络期待的输入矩阵
 print("进行矩阵拼接与 MinMaxScaler 归一化...")
-data_train_raw = np.concatenate((features_train_pca, target_train), axis=1)
-data_test_raw = np.concatenate((features_test_pca, target_test), axis=1)
+data_train_raw = np.concatenate((features_train_scaled, target_train), axis=1)
+data_test_raw = np.concatenate((features_test_scaled, target_test), axis=1)
 
 # --- 最终层隔离优化 ---
 # 4. MinMaxScaler 归一化网络整体输入：【全局绝对极值必须局限于训练集】
@@ -373,47 +382,39 @@ window = 96  # 输入序列: 过去 2 天的半小时数据 (48 * 2)
 length_size = 48  # 预测未来的序列长度: 未来 1 天 (48 * 1)
 batch_size = 128
 
-print("准备封装 PyTorch DataLoader...")
-train_loader, x_train, y_train, x_train_mark, y_train_mark = tslib_data_loader(window, length_size, batch_size,
-                                                                               data_train, data_train_mark)
-print("训练集 DataLoader 封装完成...")
-test_loader, x_test, y_test, x_test_mark, y_test_mark = tslib_data_loader(window, length_size, batch_size, data_test,
-                                                                          data_test_mark)
-print("测试集 DataLoader 封装完成...")
-"""
-# 有验证集
-
-# 数据归一化
-scaler = MinMaxScaler()
-data_inverse = scaler.fit_transform(np.array(data))
-data_length = len(data_inverse)
-train_ratio = 0.6
-val_ratio = 0.8
-# 6：2：2
-window = 30  # 模型输入序列长度 过去30天的数据
-length_size = 1  # 预测结果的序列长度  预测未来1天
+# --- V3: 公平归一化 (StandardScaler, Fit 仅在训练集) ---
+data_full = np.concatenate((features, data_target), axis=1) # 18特征+1目标
+data_length = len(data_full)
+train_ratio, val_ratio = 0.6, 0.8
 train_size = int(data_length * train_ratio)
 val_size = int(data_length * val_ratio)
-data_train = data_inverse[:train_size, :]
+
+scaler = StandardScaler()
+data_train_raw = data_full[:train_size, :]
+scaler.fit(data_train_raw)
+data_scaled = scaler.transform(data_full)
+data_dim = data_scaled.shape[1]
+
+# 切分数据集
+data_train = data_scaled[:train_size, :]
 data_train_mark = data_stamp[:train_size, :]
-data_val = data_inverse[train_size: val_size, :]
+data_val = data_scaled[train_size: val_size, :]
 data_val_mark = data_stamp[train_size: val_size, :]
-data_test = data_inverse[val_size:, :]
+data_test = data_scaled[val_size:, :]
 data_test_mark = data_stamp[val_size:, :]
-batch_size = 32
+
+# 封装 DataLoader
 train_loader, x_train, y_train, x_train_mark, y_train_mark = tslib_data_loader(window, length_size, batch_size,
                                                                                data_train, data_train_mark)
 val_loader, x_val, y_val, x_val_mark, y_val_mark = tslib_data_loader(window, length_size, batch_size, data_val,
                                                                      data_val_mark)
 test_loader, x_test, y_test, x_test_mark, y_test_mark = tslib_data_loader(window, length_size, batch_size, data_test,
                                                                           data_test_mark)
-
-                                                                          """
 device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-num_epochs = 100  # 训练迭代次数
-learning_rate = 0.0001  # 学习率
+num_epochs = 80  # 训练迭代次数
+learning_rate = 0.0001  # V6: 稳定学习率
 scheduler_patience = int(0.25 * num_epochs)  # 转换为整数  学习率调整的patience
-early_patience = 0.2  # 训练迭代的早停比例 即patience=0.25*num_epochs
+early_patience = 0.1  # 训练迭代的早停比例 即patience=0.1*num_epochs
 
 
 class Config:
@@ -433,16 +434,17 @@ class Config:
         self.dec_in = data_dim  # 解码器输入特征数量, 输入几个变量就是几
         self.enc_in = data_dim  # 编码器输入特征数量
         self.c_out = 1  # 输出维度##########这个很重要
-        # 模型超参数
-        self.d_model = 64  # 模型维度
-        self.n_heads = 4  # 多头注意力头数
+        # 模型超参数 (V6: 开启 FullAttention)
+        self.d_model = 64  # 稳定维度
+        self.n_heads = 4   # 稳定头数
         self.dropout = 0.1  # 丢弃率
-        self.e_layers = 3  # 编码器块的数量
-        self.d_layers = 3  # 解码器块的数量
-        self.d_ff = 128  # 全连接网络维度
-        self.factor = 5  # 注意力因子
+        self.e_layers = 3   # 稳定层数
+        self.d_layers = 3   # 稳定层数
+        self.d_ff = 128     # 稳定维度
+        self.factor = 5     # 注意力因子
         self.activation = 'gelu'  # 激活函数
         self.channel_independence = 0  # 频道独立性，0:频道依赖，1:频道独立
+        self.time_dims = 8  # V3: 8 维时间特征 (4 线性 + 4 Sin/Cos)
 
         self.top_k = 6  # TimesBlock中的参数
         self.num_kernels = 6  # Inception中的参数
@@ -459,11 +461,14 @@ model_type = 'DCATCN-TCNInformer'
 net = TCNInformer.Model(config).to(device)
 
 criterion = nn.MSELoss().to(device)  # 损失函数 (回归 MSE 以保证波峰捕捉力度)
-optimizer = optim.Adam(net.parameters(), lr=learning_rate)  # 优化器
-scheduler = ReduceLROnPlateau(optimizer, mode='min', factor=0.1, patience=scheduler_patience)  # 学习率调整策略
+optimizer = optim.Adam(net.parameters(), lr=learning_rate)
+scheduler = ReduceLROnPlateau(optimizer, mode='min', factor=0.5, patience=5)
 
-trained_model, train_loss, final_epoch = model_train(net, train_loader, length_size, optimizer, criterion, num_epochs,
-                                                     device, print_train=True)
+# 模型训练 (采用统一的 model_train_val)
+trained_model, train_loss, val_loss, final_epoch = model_train_val(net, train_loader, val_loader, length_size, 
+                                                                    optimizer, criterion, scheduler, num_epochs,
+                                                                    device, print_train=True)
+
 """
 trained_model, train_loss, val_loss, final_epoch = model_train_val(
     net=net,
@@ -488,35 +493,47 @@ trues = []
 with torch.no_grad():
     for x, y, x_mark, y_mark in test_loader:
         x, y, x_mark, y_mark = x.to(device), y.to(device), x_mark.to(device), y_mark.to(device)
-        outputs = trained_model(x, x_mark, y, y_mark)
+        
+        # --- 核心改进：解决数据泄露问题 ---
+        # 构造公平的解码器输入：将 y 中的预测部分 (后 length_size 步) 的目标列 (最后一列) 置 0
+        # 这样模型在预测时只能看到未来的外生变量（特征），无法通过输入直接看到 NEE 答案
+        y_masked = y.clone()
+        y_masked[:, -length_size:, -1] = 0  
+        
+        outputs = trained_model(x, x_mark, y_masked, y_mark)
         preds.append(outputs.detach().cpu().numpy())
         trues.append(y[:, -length_size:, -1:].detach().cpu().numpy())
 
 pred = np.concatenate(preds, axis=0)
 true = np.concatenate(trues, axis=0)
 
-# 检查pred和true的维度并调整
-print("Shape of true before adjustment:", true.shape)
-print("Shape of pred before adjustment:", pred.shape)
+# --- V6: 全时段评估 (Full Horizon Evaluation) ---
+# outputs shape [N, 144, 19], trues shape [N, 48, 1]
+# 我们只关注最后 length_size (48步) 的预测质量
+true = true[:, :, -1] # [N, 48, 1] -> [N, 48] (已经是 NEE 这一列)
+pred = pred[:, -length_size:, -1] # [N, 144, 19] -> [N, 48] (NEE 在最后一列)
 
-# 可能需要调整pred和true的维度，使其变为二维数组
-true = true[:, :, -1]
-pred = pred[:, :, -1]  # 假设需要将pred调整为二维数组，去掉最后一维
-# true =np.array(true)
-# 假设需要将true调整为二维数组
+print("Shape of pred after horizon adjustment:", pred.shape)
+print("Shape of true after horizon adjustment:", true.shape)
 
-print("Shape of pred after adjustment:", pred.shape)
-print("Shape of true after adjustment:", true.shape)
+# --- Scaler 只在训练集上 fit (V6 修复 NameError) ---
+target_scaler = StandardScaler()
+target_train = data_train_raw[:, -1:] # 采样原始数据最后一列 NEE
+target_scaler.fit(target_train) 
 
-# 这段代码是为了重新更新scaler，因为之前定义的scaler是是十六维，这里重新根据目标数据定义一下scaler
-y_data_test_inverse = scaler.fit_transform(np.array(data_target).reshape(-1, 1))
-pred_uninverse = scaler.inverse_transform(pred[:, -1:])  # 如果是多步预测， 选取最后一列
-true_uninverse = scaler.inverse_transform(true[:, -1:])
+# 反归一化：将整体 [N, 48] 拉平为 [N*48, 1] 进行变换，再恢复形状
+pred_uninverse = target_scaler.inverse_transform(pred.reshape(-1, 1)).reshape(pred.shape)
+true_uninverse = target_scaler.inverse_transform(true.reshape(-1, 1)).reshape(true.shape)
 
-true, pred = true_uninverse, pred_uninverse
+true_all, pred_all = true_uninverse, pred_uninverse
 
-df_eval = cal_eval(true, pred)  # 评估指标dataframe
+# 计算评价指标 (使用全时段数据，更严谨)
+df_eval = cal_eval(true_all, pred_all)  
 print(df_eval)
+
+# --- 为保存和绘图准备数据 (仅取预测窗的最后一步，以保持时间轴连续) ---
+true_plot = true_all[:, -1]
+pred_plot = pred_all[:, -1]
 
 # --- 保存结果 ---
 # 创建 result 和 img 文件夹
@@ -548,15 +565,16 @@ df_eval.to_csv(metrics_path, index=False, encoding='utf-8-sig')
 print(f'[SUCCESS] 评估指标已保存: {metrics_filename}')
 
 # 5. 保存真实值和预测值 (Data) 到专属文件夹
-test_dates = df['date'].iloc[-len(true.flatten()):].reset_index(drop=True)
+# 确保时间轴对齐：取测试集中每一个 window 对应的最后一个预测点的时间
+test_dates = df['date'].iloc[-len(true_plot):].reset_index(drop=True)
 data_filename = f'{run_folder_name}_data.csv'
 data_path = os.path.join(output_dir, data_filename)
-result_df = pd.DataFrame({'时间': test_dates,'真实值': true.flatten(), '预测值': pred.flatten()})
+result_df = pd.DataFrame({'时间': test_dates,'真实值': true_plot.flatten(), '预测值': pred_plot.flatten()})
 result_df.to_csv(data_path, index=False, encoding='utf-8-sig')
 print(f'[SUCCESS] 预测数据已保存: {data_filename}')
 
 # 6. 绘制并保存结果图 (Image) 到专属文件夹
-df_pred_true = pd.DataFrame({'Predict': pred.flatten(), 'Real': true.flatten()})
+df_pred_true = pd.DataFrame({'Predict': pred_plot.flatten(), 'Real': true_plot.flatten()})
 plt.figure(figsize=(12, 4))
 plt.plot(df_pred_true['Predict'], label='Predict', color='red', alpha=0.8)
 plt.plot(df_pred_true['Real'], label='Real', color='blue', alpha=0.5)
